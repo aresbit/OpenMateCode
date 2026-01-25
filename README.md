@@ -4,13 +4,13 @@ Telegram bot bridge for Claude Code. Send messages from Telegram, get responses 
 
 ## How it works
 
-```
-Telegram --> Cloudflare Tunnel --> Bridge --> tmux send-keys --> Claude Code
-                                                                      |
-                                                                 Stop Hook
-                                                                      |
-                                                                      v
-                                                                  Telegram
+```mermaid
+flowchart LR
+    A[Telegram] --> B[Cloudflare Tunnel]
+    B --> C[Bridge Server]
+    C -->|tmux send-keys| D[Claude Code]
+    D -->|Stop Hook| E[Read Transcript]
+    E -->|Send Response| A
 ```
 
 1. Bridge receives Telegram webhooks, injects messages into Claude Code via tmux
@@ -20,6 +20,9 @@ Telegram --> Cloudflare Tunnel --> Bridge --> tmux send-keys --> Claude Code
 ## Install
 
 ```bash
+# Prerequisites
+brew install tmux cloudflared
+
 # Clone
 git clone https://github.com/hanxiao/claudecode-telegram
 cd claudecode-telegram
@@ -27,9 +30,6 @@ cd claudecode-telegram
 # Setup Python env
 uv venv && source .venv/bin/activate
 uv pip install -e .
-
-# Install tmux
-brew install tmux  # macOS
 ```
 
 ## Setup
@@ -75,7 +75,6 @@ python bridge.py
 ### 5. Expose via Cloudflare Tunnel
 
 ```bash
-# Install: brew install cloudflared
 cloudflared tunnel --url http://localhost:8080
 ```
 
