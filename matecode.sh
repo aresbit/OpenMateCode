@@ -7,9 +7,6 @@
 
 set -e
 
-tmux kill-session -t claude
-# 关闭所有 bridge 相关进程
-pkill -f "bridge\.py|bridge-polling\.py"
 # Color codes
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -261,8 +258,6 @@ main() {
         echo "  /status    - 检查状态"
     fi
     echo ""
-    tmux a -t claude
-    claude --dangerously-skip-permissions
 }
 
 main "$@"
