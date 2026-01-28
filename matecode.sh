@@ -81,24 +81,12 @@ check_prerequisites() {
     print_success "所有依赖已满足"
 }
 
-# Setup Python virtual environment
-setup_venv() {
-    print_info "配置 Python 虚拟环境..."
+# Setup Python environment (using system Python, no venv needed)
+setup_python() {
+    print_info "检查 Python 环境..."
 
-    if [ ! -d "$VENV_DIR" ]; then
-        print_warning "虚拟环境不存在，正在创建..."
-        python3 -m venv "$VENV_DIR"
-        print_success "虚拟环境已创建"
-    fi
-
-    # source "$VENV_DIR/bin/activate"
-
-    # Skip pip install - bridge.py only uses standard libraries
-    # if [ -f "$PROJECT_DIR/setup.py" ] || [ -f "$PROJECT_DIR/pyproject.toml" ]; then
-    #     print_info "安装 Python 依赖..."
-    #     pip install -e . >/dev/null 2>&1
-    #     print_success "Python 依赖已安装"
-    # fi
+    # bridge.py only uses standard libraries, no venv needed
+    print_success "Python 检查完成 (使用系统 Python)"
 }
 
 # Setup Claude hooks
@@ -120,7 +108,11 @@ setup_claude_hooks() {
 
     # Update bot token in hook script
     if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
-        sed -i "s/TELEGRAM_BOT_TOKEN=.*/TELEGRAM_BOT_TOKEN=\"$TELEGRAM_BOT_TOKEN\"/" "$HOOKS_DIR/send-to-telegram.sh"
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            sed -i '' "s/TELEGRAM_BOT_TOKEN=.*/TELEGRAM_BOT_TOKEN=\"$TELEGRAM_BOT_TOKEN\"/" "$HOOKS_DIR/send-to-telegram.sh"
+        else
+            sed -i "s/TELEGRAM_BOT_TOKEN=.*/TELEGRAM_BOT_TOKEN=\"$TELEGRAM_BOT_TOKEN\"/" "$HOOKS_DIR/send-to-telegram.sh"
+        fi
         print_success "Bot token 已配置"
     else
         print_warning "TELEGRAM_BOT_TOKEN 未设置，请手动配置 ~/.claude/hooks/send-to-telegram.sh"
@@ -496,7 +488,7 @@ main() {
                 print_info "使用轮询模式（无需 Cloudflare Tunnel）"
             fi
             check_prerequisites
-            setup_venv
+            setup_python
             setup_claude_hooks
             start_tmux_claude
             start_bridge
@@ -516,7 +508,7 @@ main() {
                 print_info "使用轮询模式（无需 Cloudflare Tunnel）"
             fi
             check_prerequisites
-            setup_venv
+            setup_python
             setup_claude_hooks
             start_tmux_claude
             start_bridge

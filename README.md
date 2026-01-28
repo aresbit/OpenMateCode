@@ -2,6 +2,76 @@
 
 ![demo](demo.gif)
 
+## MateCode 项目总结
+
+### 项目简介
+MateCode（又名 claudecode-telegram）是一个 Telegram Bot 桥接器，让你能通过 Telegram 远程控制 Claude Code。
+
+### 核心功能
+- 📱 在 Telegram 上与 Claude 对话
+- 🔄 支持会话管理（清空、恢复、继续）
+- 🚀 两种运行模式：Webhook（快速）/ 轮询（稳定）
+- 📝 代码高亮和 HTML 格式化回复
+
+---
+
+### 架构图
+Telegram 用户
+    ↓
+Telegram Bot API ← 轮询/Webhook
+    ↓
+bridge.py (桥接服务器) ──→ 处理命令/转发消息
+    ↓
+tmux send-keys ──→ tmux 会话 "claude"
+    ↓
+Claude Code CLI
+    ↓
+读取 ~/.claude/transcripts/*.jsonl
+    ↓
+send-to-telegram.sh 钩子 ──→ 回复 Telegram
+
+---
+
+### 主要文件
+
+| 文件 | 用途 |
+|------|------|
+| matecode.sh | 主启动脚本（一键启动所有服务） |
+| bridge.py | 统一桥接服务器（支持 webhook + 轮询） |
+| bridge-polling.py | 轮询专用版本 |
+| hooks/send-to-telegram.sh | Claude Stop 钩子，发送回复到 Telegram |
+| GUIDE.md | 中文详细使用指南 |
+
+---
+
+### 支持的 Telegram 命令
+
+| 命令 | 功能 |
+|------|------|
+| /status | 检查 tmux 状态 |
+| /clear | 清空对话 |
+| /resume | 恢复会话（选择列表） |
+| /continue_ | 继续最近会话 |
+| /loop <提示词> | Ralph 循环模式（自动执行5轮） |
+| /stop | 中断 Claude |
+
+---
+
+### 运行模式对比
+
+| 模式 | 特点 | 适用场景 |
+|------|------|----------|
+| Webhook | 响应快，需 Cloudflare Tunnel | 网络畅通的环境 |
+| 轮询 | 稳定，无需隧道，穿透防火墙 | 网络受限/Cloudflare 连不上时 |
+
+---
+
+### 技术特点
+- 纯标准库 - 无外部 Python 依赖
+- 实时响应 - 通过监控 transcript 文件即时推送回复
+- 会话隔离 - 使用 telegram_pending 标记区分 Telegram 发起的对话
+- 自动回退 - 端口被占用时自动切换到轮询模式
+
 Telegram bot bridge for Claude Code. Send messages from Telegram, get responses back.
 
 ## How it works
@@ -224,4 +294,5 @@ Both modes support inline keyboard callbacks (used by `/resume` command):
     claude --dangerously-skip-permissions
     tmux kill-session -t claude
     # 关闭所有 bridge 相关进程
-  pkill -f "bridge\.py|bridge-polling\.py"
+    pkill -f "bridge\.py|bridge-polling\.py"
+    ./matecode.h start --polling
