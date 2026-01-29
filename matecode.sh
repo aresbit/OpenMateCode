@@ -38,6 +38,13 @@ check_prerequisites() {
     print_success "所有依赖已满足"
 }
 
+setup_directories() {
+    print_info "创建必要目录..."
+    mkdir -p "$HOOKS_DIR"
+    mkdir -p "$HOME/.matecode"
+    print_success "目录已创建"
+}
+
 setup_claude_hooks() {
     print_info "配置 Claude 钩子..."
     mkdir -p "$HOOKS_DIR"
@@ -104,7 +111,10 @@ start_bridge() {
     {"command": "continue_", "description": "继续最近会话"},
     {"command": "loop", "description": "Ralph 循环"},
     {"command": "stop", "description": "中断 Claude"},
-    {"command": "status", "description": "检查 tmux 状态"}
+    {"command": "status", "description": "检查 tmux 状态"},
+    {"command": "remember", "description": "保存到记忆"},
+    {"command": "recall", "description": "搜索记忆"},
+    {"command": "forget", "description": "删除记忆"}
   ]
 }
 EOF
@@ -187,6 +197,8 @@ usage() {
 
 环境变量:
     TELEGRAM_BOT_TOKEN    Telegram Bot Token (必需)
+    MEMORY_ENABLED        启用记忆功能 (默认: true)
+    MEMORY_MAX_RESULTS    每次查询最大记忆数 (默认: 5)
 
 示例:
     export TELEGRAM_BOT_TOKEN="your_token"
@@ -211,6 +223,7 @@ main() {
     case "${1:-start}" in
         start)
             check_prerequisites
+            setup_directories
             setup_claude_hooks
             start_tmux_claude
             start_bridge
@@ -223,6 +236,7 @@ main() {
             stop_services
             sleep 2
             check_prerequisites
+            setup_directories
             setup_claude_hooks
             start_tmux_claude
             start_bridge
@@ -256,6 +270,9 @@ main() {
         echo "  /continue_ - 继续最近会话"
         echo "  /resume    - 选择会话恢复"
         echo "  /status    - 检查状态"
+        echo "  /remember  - 保存到记忆 (例: /remember 我喜欢Python)"
+        echo "  /recall    - 搜索记忆 (例: /recall Python)"
+        echo "  /forget    - 删除记忆 (例: /forget all 或 /forget Python)"
     fi
     echo ""
 }

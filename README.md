@@ -7,6 +7,7 @@
 ## 功能
 
 - 📱 在 Telegram 上与 Claude 对话
+- 🧠 **长期记忆**：自动保存和召回对话历史
 - 🔄 会话管理（清空、恢复、继续）
 - 📝 代码高亮和格式化回复
 - 🔒 纯 Polling 模式，无需公网暴露
@@ -69,6 +70,25 @@ chmod +x ~/.claude/hooks/send-to-telegram.sh
 | `/resume` | 选择会话恢复 |
 | `/loop <prompt>` | Ralph 循环模式 |
 | `/stop` | 中断 Claude |
+| `/remember <text>` | 保存内容到记忆 |
+| `/recall [query]` | 搜索/查看记忆 |
+| `/forget <query/all>` | 删除记忆 |
+
+### 记忆功能
+
+MateCode 内置了基于 SQLite 的本地记忆系统：
+
+- **自动记忆**：每次对话自动保存到本地数据库
+- **智能召回**：发送消息时自动搜索相关历史记忆并注入上下文
+- **隐私安全**：所有数据存储在本地 `~/.matecode/memory.db`，不上传云端
+- **手动管理**：使用 `/remember`、`/recall`、`/forget` 命令管理记忆
+
+**环境变量配置：**
+```bash
+export MEMORY_ENABLED=true        # 启用/禁用记忆功能
+export MEMORY_MAX_RESULTS=5       # 每次查询最大记忆数
+export MEMORY_MAX_CONTEXT=2000    # 注入上下文的最大字符数
+```
 
 ## 常见命令
 
@@ -91,6 +111,7 @@ chmod +x ~/.claude/hooks/send-to-telegram.sh
 |------|------|
 | `matecode.sh` | 主启动脚本 |
 | `bridge.py` | 桥接服务器 |
+| `memory.py` | 本地记忆系统 (SQLite FTS5) |
 | `start_bridge.sh` | 单独启动 bridge |
 | `stop_bridge.sh` | 单独停止 bridge |
 | `hooks/send-to-telegram.sh` | Claude Stop 钩子 |

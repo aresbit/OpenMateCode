@@ -9,6 +9,9 @@ import time
 import urllib.request
 from pathlib import Path
 
+# Import local memory system
+from memory import get_memory
+
 # Configuration
 TMUX_SESSION = os.environ.get("TMUX_SESSION", "claude")
 CHAT_ID_FILE = os.path.expanduser("~/.claude/telegram_chat_id")
@@ -24,7 +27,15 @@ BOT_COMMANDS = [
     {"command": "loop", "description": "Ralph Loop: /loop <prompt>"},
     {"command": "stop", "description": "Interrupt Claude (Escape)"},
     {"command": "status", "description": "Check tmux status"},
+    {"command": "remember", "description": "Save to memory: /remember <text>"},
+    {"command": "recall", "description": "Search memories: /recall <query>"},
+    {"command": "forget", "description": "Delete memory: /forget <query>"},
 ]
+
+# Memory configuration
+MEMORY_ENABLED = os.environ.get("MEMORY_ENABLED", "true").lower() == "true"
+MEMORY_MAX_RESULTS = int(os.environ.get("MEMORY_MAX_RESULTS", "5"))
+MEMORY_MAX_CONTEXT = int(os.environ.get("MEMORY_MAX_CONTEXT", "2000"))
 
 BLOCKED_COMMANDS = [
     "/mcp", "/help", "/settings", "/config", "/model", "/compact", "/cost",
@@ -246,6 +257,24 @@ class ResponseMonitor:
                 print(f"Sending response to {chat_id}: {responses[:50]}...")
                 reply(chat_id, responses)
 
+                # Save conversation to memory
+                if MEMORY_ENABLED and str(chat_id) in recent_messages:
+                    try:
+                        user_msg = recent_messages[str(chat_id)]
+                        memory = get_memory()
+                        memory.add(
+                            str(chat_id),
+                            f"Q: {user_msg}\nA: {responses[:2000]}",  # Limit response length
+                            metadata={"type": "conversation"}
+                        )
+                        print(f"Saved conversation to memory for {chat_id}")
+                        # Clean up
+                        del recent_messages[str(chat_id)]
+                        if str(chat_id) in recent_full_prompts:
+                            del recent_full_prompts[str(chat_id)]
+                    except Exception as e:
+                        print(f"Error saving to memory: {e}")
+
                 if os.path.exists(PENDING_FILE):
                     os.remove(PENDING_FILE)
 
@@ -257,6 +286,10 @@ class ResponseMonitor:
 
 # Global response monitor instance
 response_monitor = ResponseMonitor()
+
+# Recent messages storage for memory (chat_id -> last_user_message)
+recent_messages = {}
+recent_full_prompts = {}
 
 
 # ============ Bot Handler ============
@@ -369,12 +402,91 @@ class BotHandler:
                 telegram_api("sendMessage", {"chat_id": chat_id, "text": "Select session:", "reply_markup": {"inline_keyboard": kb}})
                 return
 
+            if cmd == "/remember":
+                parts = text.split(maxsplit=1)
+                if len(parts) < 2:
+                    reply(chat_id, "Usage: /remember \u003ctext\u003e")
+                    return
+                content = parts[1]
+                memory = get_memory()
+                if memory.add(str(chat_id), content, metadata={"type": "manual"}):
+                    reply(chat_id, "✅ Saved to memory")
+                else:
+                    reply(chat_id, "❌ Failed to save")
+                return
+
+            if cmd == "/recall":
+                parts = text.split(maxsplit=1)
+                memory = get_memory()
+                if len(parts) < 2:
+                    # Show recent memories
+                    results = memory.get_recent(str(chat_id), limit=10)
+                else:
+                    query = parts[1]
+                    results = memory.search(str(chat_id), query, limit=10)
+
+                if not results:
+                    reply(chat_id, "No memories found")
+                    return
+
+                lines = ["📚 Your memories:", ""]
+                for i, mem in enumerate(results[:10], 1):
+                    content = mem["content"][:100]
+                    if len(mem["content"]) > 100:
+                        content += "..."
+                    lines.append(f"{i}. {content}")
+
+                reply(chat_id, "\n".join(lines))
+                return
+
+            if cmd == "/forget":
+                parts = text.split(maxsplit=1)
+                if len(parts) < 2:
+                    reply(chat_id, "Usage: /forget \u003cquery or 'all'\u003e")
+                    return
+
+                query = parts[1]
+                memory = get_memory()
+
+                if query.lower() == "all":
+                    if memory.clear_all(str(chat_id)):
+                        reply(chat_id, "🗑️ All memories cleared")
+                    else:
+                        reply(chat_id, "❌ Failed to clear")
+                else:
+                    count = memory.delete_by_query(str(chat_id), query)
+                    reply(chat_id, f"🗑️ Deleted {count} memory(s)")
+                return
+
+            if cmd == "/memstats":
+                memory = get_memory()
+                stats = memory.get_stats(str(chat_id))
+                reply(chat_id,
+                    f"📊 Memory Stats:\n"
+                    f"Total: {stats['count']} memories\n"
+                    f"Newest: {stats['newest'] or 'N/A'}\n"
+                    f"Oldest: {stats['oldest'] or 'N/A'}")
+                return
+
             if cmd in BLOCKED_COMMANDS:
                 reply(chat_id, f"'{cmd}' not supported (interactive)")
                 return
 
-        # Regular message
+        # Regular message - inject memory context
         print(f"[{chat_id}] {text[:50]}...")
+
+        # Search and inject relevant memories
+        memory_text = ""
+        if MEMORY_ENABLED:
+            try:
+                memory = get_memory()
+                memories = memory.search(str(chat_id), text, limit=MEMORY_MAX_RESULTS)
+                if memories:
+                    memory_text = memory.format_for_prompt(memories, max_chars=MEMORY_MAX_CONTEXT)
+                    print(f"Injected {len(memories)} memories into context")
+            except Exception as e:
+                print(f"Memory search error: {e}")
+
         with open(PENDING_FILE, "w") as f:
             f.write(str(int(time.time())))
 
@@ -391,7 +503,18 @@ class BotHandler:
             return
 
         threading.Thread(target=send_typing_loop, args=(chat_id,), daemon=True).start()
-        tmux_send(text)
+
+        # Build full prompt with memory context
+        if memory_text:
+            full_prompt = f"{memory_text}\n\n---\n\n{text}"
+        else:
+            full_prompt = text
+
+        # Store for later memory saving
+        recent_messages[str(chat_id)] = text
+        recent_full_prompts[str(chat_id)] = full_prompt
+
+        tmux_send(full_prompt)
         tmux_send_enter()
 
     def handle_callback_query(self, callback_query):
