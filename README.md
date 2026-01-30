@@ -51,6 +51,9 @@ chmod +x ~/.claude/hooks/send-to-telegram.sh
 ```
 
 ## 命令
+- ./matecode.sh
+- ./tmux-setup.sh
+- tmux source-file ~/.tmux.conf
 
 ```bash
 ./matecode.sh start      # 启动服务
