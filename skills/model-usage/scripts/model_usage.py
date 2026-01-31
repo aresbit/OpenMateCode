@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""
-Summarize CodexBar local cost usage by model.
-
-Defaults to current model (most recent daily entry), or list all models.
-"""
+"""Summarize CodexBar local cost usage by model."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -29,10 +24,12 @@ def run_codexbar_cost(provider: str) -> List[Dict[str, Any]]:
         raise RuntimeError("codexbar not found on PATH. Install CodexBar CLI first.")
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"codexbar cost failed (exit {exc.returncode}).")
+
     try:
         payload = json.loads(output)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Failed to parse codexbar JSON output: {exc}")
+
     if not isinstance(payload, list):
         raise RuntimeError("Expected codexbar cost JSON array.")
     return payload
@@ -43,8 +40,8 @@ def load_payload(input_path: Optional[str], provider: str) -> Dict[str, Any]:
         if input_path == "-":
             raw = sys.stdin.read()
         else:
-            with open(input_path, "r", encoding="utf-8") as handle:
-                raw = handle.read()
+            with open(input_path, "r", encoding="utf-8") as f:
+                raw = f.read()
         data = json.loads(raw)
     else:
         data = run_codexbar_cost(provider)
@@ -68,12 +65,8 @@ class ModelCost:
 
 
 def parse_daily_entries(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    daily = payload.get("daily")
-    if not daily:
-        return []
-    if not isinstance(daily, list):
-        return []
-    return [entry for entry in daily if isinstance(entry, dict)]
+    daily = payload.get("daily", [])
+    return [entry for entry in daily if isinstance(entry, dict)] if isinstance(daily, list) else []
 
 
 def parse_date(value: str) -> Optional[date]:
@@ -86,92 +79,94 @@ def parse_date(value: str) -> Optional[date]:
 def filter_by_days(entries: List[Dict[str, Any]], days: Optional[int]) -> List[Dict[str, Any]]:
     if not days:
         return entries
+
     cutoff = date.today() - timedelta(days=days - 1)
     filtered: List[Dict[str, Any]] = []
+
     for entry in entries:
         day = entry.get("date")
-        if not isinstance(day, str):
-            continue
-        parsed = parse_date(day)
-        if parsed and parsed >= cutoff:
-            filtered.append(entry)
+        if isinstance(day, str):
+            parsed = parse_date(day)
+            if parsed and parsed >= cutoff:
+                filtered.append(entry)
+
     return filtered
 
 
 def aggregate_costs(entries: Iterable[Dict[str, Any]]) -> Dict[str, float]:
     totals: Dict[str, float] = {}
+
     for entry in entries:
-        breakdowns = entry.get("modelBreakdowns")
-        if not breakdowns:
-            continue
+        breakdowns = entry.get("modelBreakdowns", [])
         if not isinstance(breakdowns, list):
             continue
+
         for item in breakdowns:
             if not isinstance(item, dict):
                 continue
             model = item.get("modelName")
             cost = item.get("cost")
-            if not isinstance(model, str):
-                continue
-            if not isinstance(cost, (int, float)):
-                continue
-            totals[model] = totals.get(model, 0.0) + float(cost)
+            if isinstance(model, str) and isinstance(cost, (int, float)):
+                totals[model] = totals.get(model, 0.0) + float(cost)
+
     return totals
 
 
 def pick_current_model(entries: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
     if not entries:
         return None, None
-    sorted_entries = sorted(
-        entries,
-        key=lambda entry: entry.get("date") or "",
-    )
+
+    sorted_entries = sorted(entries, key=lambda e: e.get("date", ""))
+
     for entry in reversed(sorted_entries):
-        breakdowns = entry.get("modelBreakdowns")
+        breakdowns = entry.get("modelBreakdowns", [])
         if isinstance(breakdowns, list) and breakdowns:
-            scored: List[ModelCost] = []
-            for item in breakdowns:
-                if not isinstance(item, dict):
-                    continue
-                model = item.get("modelName")
-                cost = item.get("cost")
-                if isinstance(model, str) and isinstance(cost, (int, float)):
-                    scored.append(ModelCost(model=model, cost=float(cost)))
+            scored: List[ModelCost] = [
+                ModelCost(model=item.get("modelName"), cost=float(item.get("cost", 0)))
+                for item in breakdowns
+                if isinstance(item, dict)
+                and isinstance(item.get("modelName"), str)
+                and isinstance(item.get("cost"), (int, float))
+            ]
             if scored:
                 scored.sort(key=lambda item: item.cost, reverse=True)
                 return scored[0].model, entry.get("date") if isinstance(entry.get("date"), str) else None
-        models_used = entry.get("modelsUsed")
+
+        models_used = entry.get("modelsUsed", [])
         if isinstance(models_used, list) and models_used:
             last = models_used[-1]
             if isinstance(last, str):
                 return last, entry.get("date") if isinstance(entry.get("date"), str) else None
+
     return None, None
 
 
 def usd(value: Optional[float]) -> str:
-    if value is None:
-        return "—"
-    return f"${value:,.2f}"
+    return "—" if value is None else f"${value:,.2f}"
 
 
 def latest_day_cost(entries: List[Dict[str, Any]], model: str) -> Tuple[Optional[str], Optional[float]]:
     if not entries:
         return None, None
-    sorted_entries = sorted(
-        entries,
-        key=lambda entry: entry.get("date") or "",
-    )
+
+    sorted_entries = sorted(entries, key=lambda e: e.get("date", ""))
+
     for entry in reversed(sorted_entries):
-        breakdowns = entry.get("modelBreakdowns")
+        breakdowns = entry.get("modelBreakdowns", [])
         if not isinstance(breakdowns, list):
             continue
+
         for item in breakdowns:
             if not isinstance(item, dict):
                 continue
             if item.get("modelName") == model:
-                cost = item.get("cost") if isinstance(item.get("cost"), (int, float)) else None
-                day = entry.get("date") if isinstance(entry.get("date"), str) else None
-                return day, float(cost) if cost is not None else None
+                cost = item.get("cost")
+                day = entry.get("date")
+                return (
+                    day if isinstance(day, str) else None,
+                    float(cost) if isinstance(cost, (int, float)) else None
+                )
+
     return None, None
 
 
@@ -262,6 +257,7 @@ def main() -> int:
         if not model:
             eprint("No model data found in codexbar cost payload.")
             return 2
+
         totals = aggregate_costs(entries)
         total_cost = totals.get(model)
         latest_cost_date, latest_cost = latest_day_cost(entries, model)

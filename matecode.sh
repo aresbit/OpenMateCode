@@ -164,13 +164,14 @@ stop_services() {
             print_success "Bridge 已停止"
         fi
         rm -f "$PROJECT_DIR/bridge.pid"
-    fi
+        pkill -f "bridge\.py|bridge-polling\.py"
+     fi
 
     rm -f ~/.claude/telegram_pending
     rm -f ~/.claude/telegram_chat_id
 
     if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-        print_warning "tmux 会话仍然运行 (如需关闭: tmux attach -t $TMUX_SESSION)"
+        print_warning "tmux 会话仍然运行 (如需关闭: tmux kill-session -t $TMUX_SESSION)"
     fi
 }
 
@@ -273,6 +274,9 @@ main() {
         echo "  /remember  - 保存到记忆 (例: /remember 我喜欢Python)"
         echo "  /recall    - 搜索记忆 (例: /recall Python)"
         echo "  /forget    - 删除记忆 (例: /forget all 或 /forget Python)"
+        echo ""
+        # Attach to tmux session
+        tmux attach-session -t "$TMUX_SESSION"
     fi
     echo ""
 }

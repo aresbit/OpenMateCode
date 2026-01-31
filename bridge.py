@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """MateCode - Claude Code Telegram Bridge (Polling Mode)"""
 
-import os
 import json
+import os
+import re
 import subprocess
 import threading
 import time
 import urllib.request
 from pathlib import Path
 
-# Import local memory system
 from memory import get_memory
 
 # Configuration
@@ -20,28 +20,33 @@ HISTORY_FILE = os.path.expanduser("~/.claude/history.jsonl")
 UPDATE_OFFSET_FILE = os.path.expanduser("~/.claude/telegram_offset")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
+MEMORY_ENABLED = os.environ.get("MEMORY_ENABLED", "true").lower() == "true"
+MEMORY_MAX_RESULTS = int(os.environ.get("MEMORY_MAX_RESULTS", "5"))
+MEMORY_MAX_CONTEXT = int(os.environ.get("MEMORY_MAX_CONTEXT", "2000"))
+
 BOT_COMMANDS = [
     {"command": "clear", "description": "Clear conversation"},
     {"command": "resume", "description": "Resume session (shows picker)"},
     {"command": "continue_", "description": "Continue most recent session"},
     {"command": "loop", "description": "Ralph Loop: /loop <prompt>"},
+    {"command": "meta_loop", "description": "Meta Loop with auto-memory: /meta_loop <prompt>"},
     {"command": "stop", "description": "Interrupt Claude (Escape)"},
     {"command": "status", "description": "Check tmux status"},
     {"command": "remember", "description": "Save to memory: /remember <text>"},
     {"command": "recall", "description": "Search memories: /recall <query>"},
     {"command": "forget", "description": "Delete memory: /forget <query>"},
+    {"command": "metamem", "description": "View meta-update memories"},
 ]
 
-# Memory configuration
-MEMORY_ENABLED = os.environ.get("MEMORY_ENABLED", "true").lower() == "true"
-MEMORY_MAX_RESULTS = int(os.environ.get("MEMORY_MAX_RESULTS", "5"))
-MEMORY_MAX_CONTEXT = int(os.environ.get("MEMORY_MAX_CONTEXT", "2000"))
-
-BLOCKED_COMMANDS = [
+BLOCKED_COMMANDS = {
     "/mcp", "/help", "/settings", "/config", "/model", "/compact", "/cost",
     "/doctor", "/init", "/login", "/logout", "/memory", "/permissions",
     "/pr", "/review", "/terminal", "/vim", "/approved-tools", "/listen"
-]
+}
+
+# Global state
+recent_messages = {}
+recent_full_prompts = {}
 
 
 def telegram_api(method, data):
@@ -49,6 +54,7 @@ def telegram_api(method, data):
     if not BOT_TOKEN:
         print("Error: TELEGRAM_BOT_TOKEN not set")
         return None
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     req = urllib.request.Request(
         url,
@@ -94,7 +100,10 @@ def reply(chat_id, text):
 
 def tmux_exists():
     """Check if tmux session exists."""
-    return subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION], capture_output=True).returncode == 0
+    return subprocess.run(
+        ["tmux", "has-session", "-t", TMUX_SESSION],
+        capture_output=True
+    ).returncode == 0
 
 
 def tmux_send(text, literal=True):
@@ -116,12 +125,61 @@ def tmux_send_escape():
     subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "Escape"])
 
 
+# ============ CLAUDE.md Loader ============
+
+def load_claude_md() -> str:
+    """Load .CLAUDE.md from project or home directory."""
+    paths = [Path(".CLAUDE.md"), Path.home() / ".claude" / ".CLAUDE.md"]
+    for path in paths:
+        if path.exists():
+            try:
+                return path.read_text(encoding="utf-8")
+            except Exception as e:
+                print(f"Error reading {path}: {e}")
+    return ""
+
+
+def extract_meta_prompt(claude_md_content: str) -> str:
+    """Extract the meta-prompt section from .CLAUDE.md content."""
+    if not claude_md_content:
+        return ""
+
+    lines = claude_md_content.split("\n")
+    in_initial_prompt = False
+    prompt_lines = []
+
+    for line in lines:
+        if line.strip() == "## 初始提示词":
+            in_initial_prompt = True
+            continue
+        if in_initial_prompt:
+            if line.startswith("## "):
+                break
+            prompt_lines.append(line)
+
+    return "\n".join(prompt_lines).strip()
+
+
+def extract_memory_update(response: str) -> tuple[str, str]:
+    """Extract memory update from Claude's response."""
+    pattern = r"<memory_update>(.*?)</memory_update>"
+    match = re.search(pattern, response, re.DOTALL)
+
+    if match:
+        memory_content = match.group(1).strip()
+        cleaned_response = re.sub(pattern, "", response, flags=re.DOTALL).strip()
+        return cleaned_response, memory_content
+
+    return response, ""
+
+
 # ============ Session Management ============
 
 def get_recent_sessions(limit=5):
     """Get list of recent Claude sessions."""
     if not os.path.exists(HISTORY_FILE):
         return []
+
     sessions = []
     try:
         with open(HISTORY_FILE) as f:
@@ -132,6 +190,7 @@ def get_recent_sessions(limit=5):
                     continue
     except:
         return []
+
     sessions.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
     return sessions[:limit]
 
@@ -155,10 +214,9 @@ def find_latest_transcript():
     transcripts_dir = Path.home() / ".claude" / "transcripts"
     if not transcripts_dir.exists():
         return None
+
     transcript_files = list(transcripts_dir.glob("*.jsonl"))
-    if not transcript_files:
-        return None
-    return max(transcript_files, key=lambda p: p.stat().st_mtime)
+    return max(transcript_files, key=lambda p: p.stat().st_mtime) if transcript_files else None
 
 
 def extract_assistant_responses(transcript_path, last_response_pos=0):
@@ -180,8 +238,7 @@ def extract_assistant_responses(transcript_path, last_response_pos=0):
                     entry = json.loads(line.strip())
                     if entry.get("type") == "assistant":
                         message = entry.get("message", {})
-                        content_blocks = message.get("content", [])
-                        for block in content_blocks:
+                        for block in message.get("content", []):
                             if block.get("type") == "text":
                                 responses.append(block.get("text", ""))
                 except:
@@ -242,54 +299,65 @@ class ResponseMonitor:
             self.last_transcript_path = transcript_path
             self.last_position = 0
 
-        responses, new_position = extract_assistant_responses(
-            transcript_path, self.last_position
-        )
+        responses, new_position = extract_assistant_responses(transcript_path, self.last_position)
 
-        if responses and new_position > self.last_position:
-            if not os.path.exists(CHAT_ID_FILE):
-                return
+        if not responses or new_position <= self.last_position:
+            return
 
-            try:
-                with open(CHAT_ID_FILE) as f:
-                    chat_id = int(f.read().strip())
+        if not os.path.exists(CHAT_ID_FILE):
+            return
 
-                print(f"Sending response to {chat_id}: {responses[:50]}...")
-                reply(chat_id, responses)
+        try:
+            with open(CHAT_ID_FILE) as f:
+                chat_id = int(f.read().strip())
 
-                # Save conversation to memory
-                if MEMORY_ENABLED and str(chat_id) in recent_messages:
-                    try:
-                        user_msg = recent_messages[str(chat_id)]
-                        memory = get_memory()
-                        memory.add(
-                            str(chat_id),
-                            f"Q: {user_msg}\nA: {responses[:2000]}",  # Limit response length
-                            metadata={"type": "conversation"}
-                        )
-                        print(f"Saved conversation to memory for {chat_id}")
-                        # Clean up
-                        del recent_messages[str(chat_id)]
-                        if str(chat_id) in recent_full_prompts:
-                            del recent_full_prompts[str(chat_id)]
-                    except Exception as e:
-                        print(f"Error saving to memory: {e}")
+            cleaned_responses, memory_update = extract_memory_update(responses)
+            print(f"Sending response to {chat_id}: {cleaned_responses[:50]}...")
+            reply(chat_id, cleaned_responses)
 
-                if os.path.exists(PENDING_FILE):
-                    os.remove(PENDING_FILE)
+            self._save_to_memory(chat_id, cleaned_responses, memory_update)
 
-            except Exception as e:
-                print(f"Error sending response: {e}")
+            if os.path.exists(PENDING_FILE):
+                os.remove(PENDING_FILE)
 
-            self.last_position = new_position
+        except Exception as e:
+            print(f"Error sending response: {e}")
+
+        self.last_position = new_position
+
+    def _save_to_memory(self, chat_id, cleaned_responses, memory_update):
+        """Save conversation to memory."""
+        if not MEMORY_ENABLED or str(chat_id) not in recent_messages:
+            return
+
+        try:
+            user_msg = recent_messages[str(chat_id)]
+            memory = get_memory()
+
+            memory.add(
+                str(chat_id),
+                f"Q: {user_msg}\nA: {cleaned_responses[:2000]}",
+                metadata={"type": "conversation"}
+            )
+            print(f"Saved conversation to memory for {chat_id}")
+
+            if memory_update:
+                memory.add(
+                    str(chat_id),
+                    memory_update[:5000],
+                    metadata={"type": "meta_update", "auto": True},
+                    message_type="meta_update"
+                )
+                print(f"Saved meta-update to memory for {chat_id}")
+
+            recent_messages.pop(str(chat_id), None)
+            recent_full_prompts.pop(str(chat_id), None)
+
+        except Exception as e:
+            print(f"Error saving to memory: {e}")
 
 
-# Global response monitor instance
 response_monitor = ResponseMonitor()
-
-# Recent messages storage for memory (chat_id -> last_user_message)
-recent_messages = {}
-recent_full_prompts = {}
 
 
 # ============ Bot Handler ============
@@ -297,10 +365,23 @@ recent_full_prompts = {}
 class BotHandler:
     """Handle Telegram bot updates."""
 
-    def __init__(self):
-        self.offset = self.load_offset()
+    META_LOOP_INSTRUCTION = """
+【自我涉指协议】
+这是递归自我涉指模式。你需要：
+1. 完成用户的请求
+2. 分析本轮交互中的关键信息和学习点
+3. 在回复末尾使用 <memory_update> 标签输出更新后的系统提示词
 
-    def load_offset(self):
+格式：
+<memory_update>
+[更新后的完整提示词内容]
+</memory_update>
+"""
+
+    def __init__(self):
+        self.offset = self._load_offset()
+
+    def _load_offset(self):
         """Load update offset from file."""
         if os.path.exists(UPDATE_OFFSET_FILE):
             try:
@@ -310,10 +391,49 @@ class BotHandler:
                 pass
         return 0
 
-    def save_offset(self, offset):
+    def _save_offset(self, offset):
         """Save update offset to file."""
         with open(UPDATE_OFFSET_FILE, "w") as f:
             f.write(str(offset))
+
+    def _require_tmux(self, chat_id):
+        """Check if tmux exists, reply with error if not."""
+        if not tmux_exists():
+            reply(chat_id, "tmux not found")
+            return False
+        return True
+
+    def _start_typing(self, chat_id):
+        """Start typing indicator."""
+        with open(PENDING_FILE, "w") as f:
+            f.write(str(int(time.time())))
+        threading.Thread(target=send_typing_loop, args=(chat_id,), daemon=True).start()
+
+    def _build_full_prompt(self, text, chat_id):
+        """Build full prompt with memory context and meta-prompt."""
+        prompt_parts = []
+
+        if MEMORY_ENABLED:
+            try:
+                memory = get_memory()
+                memories = memory.search(str(chat_id), text, limit=MEMORY_MAX_RESULTS)
+                if memories:
+                    memory_text = memory.format_for_prompt(memories, max_chars=MEMORY_MAX_CONTEXT)
+                    if memory_text:
+                        prompt_parts.append(memory_text)
+                        print(f"Injected {len(memories)} memories into context")
+            except Exception as e:
+                print(f"Memory search error: {e}")
+
+        claude_md_content = load_claude_md()
+        meta_prompt = extract_meta_prompt(claude_md_content)
+        if meta_prompt:
+            prompt_parts.append(f"【系统指令】\n{meta_prompt}")
+            print(f"Injected CLAUDE.md meta-prompt ({len(meta_prompt)} chars)")
+
+        if prompt_parts:
+            return "\n\n---\n\n".join(prompt_parts) + f"\n\n---\n\n{text}"
+        return text
 
     def handle_message(self, msg):
         """Process incoming message from Telegram."""
@@ -330,162 +450,12 @@ class BotHandler:
 
         # Handle commands
         if text.startswith("/"):
-            cmd = text.split()[0].lower()
+            return self._handle_command(text, chat_id)
 
-            if cmd == "/status":
-                status = "running" if tmux_exists() else "not found"
-                reply(chat_id, f"tmux '{TMUX_SESSION}': {status}")
-                return
-
-            if cmd == "/stop":
-                if tmux_exists():
-                    tmux_send_escape()
-                if os.path.exists(PENDING_FILE):
-                    os.remove(PENDING_FILE)
-                reply(chat_id, "Interrupted")
-                return
-
-            if cmd == "/clear":
-                if not tmux_exists():
-                    reply(chat_id, "tmux not found")
-                    return
-                tmux_send_escape()
-                time.sleep(0.2)
-                tmux_send("/clear")
-                tmux_send_enter()
-                reply(chat_id, "Cleared")
-                return
-
-            if cmd == "/continue_":
-                if not tmux_exists():
-                    reply(chat_id, "tmux not found")
-                    return
-                tmux_send_escape()
-                time.sleep(0.2)
-                tmux_send("/exit")
-                tmux_send_enter()
-                time.sleep(0.5)
-                tmux_send("claude --continue --dangerously-skip-permissions")
-                tmux_send_enter()
-                reply(chat_id, "Continuing...")
-                return
-
-            if cmd == "/loop":
-                if not tmux_exists():
-                    reply(chat_id, "tmux not found")
-                    return
-                parts = text.split(maxsplit=1)
-                if len(parts) < 2:
-                    reply(chat_id, "Usage: /loop <prompt>")
-                    return
-                prompt = parts[1].replace('"', '\\"')
-                full = f'{prompt} Output <promise>DONE</promise> when complete.'
-                with open(PENDING_FILE, "w") as f:
-                    f.write(str(int(time.time())))
-                threading.Thread(target=send_typing_loop, args=(chat_id,), daemon=True).start()
-                tmux_send(f'/ralph-loop:ralph-loop "{full}" --max-iterations 5 --completion-promise "DONE"')
-                time.sleep(0.3)
-                tmux_send_enter()
-                reply(chat_id, "Ralph Loop started (max 5 iterations)")
-                return
-
-            if cmd == "/resume":
-                sessions = get_recent_sessions()
-                if not sessions:
-                    reply(chat_id, "No sessions")
-                    return
-                kb = [[{"text": "Continue most recent", "callback_data": "continue_recent"}]]
-                for s in sessions:
-                    sid = get_session_id(s.get("project", ""))
-                    if sid:
-                        kb.append([{"text": s.get("display", "?")[:40] + "...", "callback_data": f"resume:{sid}"}])
-                telegram_api("sendMessage", {"chat_id": chat_id, "text": "Select session:", "reply_markup": {"inline_keyboard": kb}})
-                return
-
-            if cmd == "/remember":
-                parts = text.split(maxsplit=1)
-                if len(parts) < 2:
-                    reply(chat_id, "Usage: /remember \u003ctext\u003e")
-                    return
-                content = parts[1]
-                memory = get_memory()
-                if memory.add(str(chat_id), content, metadata={"type": "manual"}):
-                    reply(chat_id, "✅ Saved to memory")
-                else:
-                    reply(chat_id, "❌ Failed to save")
-                return
-
-            if cmd == "/recall":
-                parts = text.split(maxsplit=1)
-                memory = get_memory()
-                if len(parts) < 2:
-                    # Show recent memories
-                    results = memory.get_recent(str(chat_id), limit=10)
-                else:
-                    query = parts[1]
-                    results = memory.search(str(chat_id), query, limit=10)
-
-                if not results:
-                    reply(chat_id, "No memories found")
-                    return
-
-                lines = ["📚 Your memories:", ""]
-                for i, mem in enumerate(results[:10], 1):
-                    content = mem["content"][:100]
-                    if len(mem["content"]) > 100:
-                        content += "..."
-                    lines.append(f"{i}. {content}")
-
-                reply(chat_id, "\n".join(lines))
-                return
-
-            if cmd == "/forget":
-                parts = text.split(maxsplit=1)
-                if len(parts) < 2:
-                    reply(chat_id, "Usage: /forget \u003cquery or 'all'\u003e")
-                    return
-
-                query = parts[1]
-                memory = get_memory()
-
-                if query.lower() == "all":
-                    if memory.clear_all(str(chat_id)):
-                        reply(chat_id, "🗑️ All memories cleared")
-                    else:
-                        reply(chat_id, "❌ Failed to clear")
-                else:
-                    count = memory.delete_by_query(str(chat_id), query)
-                    reply(chat_id, f"🗑️ Deleted {count} memory(s)")
-                return
-
-            if cmd == "/memstats":
-                memory = get_memory()
-                stats = memory.get_stats(str(chat_id))
-                reply(chat_id,
-                    f"📊 Memory Stats:\n"
-                    f"Total: {stats['count']} memories\n"
-                    f"Newest: {stats['newest'] or 'N/A'}\n"
-                    f"Oldest: {stats['oldest'] or 'N/A'}")
-                return
-
-            if cmd in BLOCKED_COMMANDS:
-                reply(chat_id, f"'{cmd}' not supported (interactive)")
-                return
-
-        # Regular message - inject memory context
+        # Regular message
         print(f"[{chat_id}] {text[:50]}...")
 
-        # Search and inject relevant memories
-        memory_text = ""
-        if MEMORY_ENABLED:
-            try:
-                memory = get_memory()
-                memories = memory.search(str(chat_id), text, limit=MEMORY_MAX_RESULTS)
-                if memories:
-                    memory_text = memory.format_for_prompt(memories, max_chars=MEMORY_MAX_CONTEXT)
-                    print(f"Injected {len(memories)} memories into context")
-            except Exception as e:
-                print(f"Memory search error: {e}")
+        full_prompt = self._build_full_prompt(text, chat_id)
 
         with open(PENDING_FILE, "w") as f:
             f.write(str(int(time.time())))
@@ -494,28 +464,212 @@ class BotHandler:
             telegram_api("setMessageReaction", {
                 "chat_id": chat_id,
                 "message_id": msg_id,
-                "reaction": [{"type": "emoji", "emoji": "\u2705"}]
+                "reaction": [{"type": "emoji", "emoji": "✅"}]
             })
 
-        if not tmux_exists():
-            reply(chat_id, "tmux not found")
+        if not self._require_tmux(chat_id):
             os.remove(PENDING_FILE)
             return
 
-        threading.Thread(target=send_typing_loop, args=(chat_id,), daemon=True).start()
+        self._start_typing(chat_id)
 
-        # Build full prompt with memory context
-        if memory_text:
-            full_prompt = f"{memory_text}\n\n---\n\n{text}"
-        else:
-            full_prompt = text
-
-        # Store for later memory saving
         recent_messages[str(chat_id)] = text
         recent_full_prompts[str(chat_id)] = full_prompt
 
         tmux_send(full_prompt)
         tmux_send_enter()
+
+    def _handle_command(self, text, chat_id):
+        """Handle bot commands."""
+        parts = text.split(maxsplit=1)
+        cmd = parts[0].lower()
+        args = parts[1] if len(parts) > 1 else ""
+
+        handlers = {
+            "/status": self._cmd_status,
+            "/stop": self._cmd_stop,
+            "/clear": self._cmd_clear,
+            "/continue_": self._cmd_continue,
+            "/loop": self._cmd_loop,
+            "/meta_loop": self._cmd_meta_loop,
+            "/resume": self._cmd_resume,
+            "/remember": self._cmd_remember,
+            "/recall": self._cmd_recall,
+            "/forget": self._cmd_forget,
+            "/memstats": self._cmd_memstats,
+            "/metamem": self._cmd_metamem,
+        }
+
+        if cmd in handlers:
+            handlers[cmd](chat_id, args)
+        elif cmd in BLOCKED_COMMANDS:
+            reply(chat_id, f"'{cmd}' not supported (interactive)")
+
+    def _cmd_status(self, chat_id, _):
+        status = "running" if tmux_exists() else "not found"
+        reply(chat_id, f"tmux '{TMUX_SESSION}': {status}")
+
+    def _cmd_stop(self, chat_id, _):
+        if tmux_exists():
+            tmux_send_escape()
+        if os.path.exists(PENDING_FILE):
+            os.remove(PENDING_FILE)
+        reply(chat_id, "Interrupted")
+
+    def _cmd_clear(self, chat_id, _):
+        if not self._require_tmux(chat_id):
+            return
+        tmux_send_escape()
+        time.sleep(0.2)
+        tmux_send("/clear")
+        tmux_send_enter()
+        reply(chat_id, "Cleared")
+
+    def _cmd_continue(self, chat_id, _):
+        if not self._require_tmux(chat_id):
+            return
+        tmux_send_escape()
+        time.sleep(0.2)
+        tmux_send("/exit")
+        tmux_send_enter()
+        time.sleep(0.5)
+        tmux_send("claude --continue --dangerously-skip-permissions")
+        tmux_send_enter()
+        reply(chat_id, "Continuing...")
+
+    def _cmd_loop(self, chat_id, args):
+        if not self._require_tmux(chat_id):
+            return
+        if not args:
+            reply(chat_id, "Usage: /loop <prompt>")
+            return
+
+        prompt = args.replace('"', '\\"')
+        full = f'{prompt} Output <promise>DONE</promise> when complete.'
+
+        self._start_typing(chat_id)
+        tmux_send(f'/ralph-loop:ralph-loop "{full}" --max-iterations 5 --completion-promise "DONE"')
+        time.sleep(0.3)
+        tmux_send_enter()
+        reply(chat_id, "Ralph Loop started (max 5 iterations)")
+
+    def _cmd_meta_loop(self, chat_id, args):
+        if not self._require_tmux(chat_id):
+            return
+        if not args:
+            reply(chat_id, "Usage: /meta_loop <prompt>")
+            return
+
+        claude_md_content = load_claude_md()
+        meta_prompt = extract_meta_prompt(claude_md_content)
+
+        if meta_prompt:
+            full_prompt = f"【系统角色】\n{meta_prompt}\n\n{self.META_LOOP_INSTRUCTION}\n\n---\n\n用户请求: {args}\n\n请完成任务并输出记忆更新。"
+        else:
+            full_prompt = f"{self.META_LOOP_INSTRUCTION}\n\n---\n\n用户请求: {args}\n\n请完成任务并输出记忆更新。"
+
+        full_prompt_escaped = full_prompt.replace('"', '\\"')
+
+        self._start_typing(chat_id)
+        loop_prompt = f'{full_prompt_escaped} Output <promise>DONE</promise> when complete.'
+        tmux_send(f'/ralph-loop:ralph-loop "{loop_prompt}" --max-iterations 5 --completion-promise "DONE"')
+        time.sleep(0.3)
+        tmux_send_enter()
+        reply(chat_id, "Meta Loop started (auto-memory enabled, max 5 iterations)")
+
+    def _cmd_resume(self, chat_id, _):
+        sessions = get_recent_sessions()
+        if not sessions:
+            reply(chat_id, "No sessions")
+            return
+
+        kb = [[{"text": "Continue most recent", "callback_data": "continue_recent"}]]
+        for s in sessions:
+            sid = get_session_id(s.get("project", ""))
+            if sid:
+                kb.append([{"text": s.get("display", "?")[:40] + "...", "callback_data": f"resume:{sid}"}])
+
+        telegram_api("sendMessage", {
+            "chat_id": chat_id,
+            "text": "Select session:",
+            "reply_markup": {"inline_keyboard": kb}
+        })
+
+    def _cmd_remember(self, chat_id, args):
+        if not args:
+            reply(chat_id, "Usage: /remember <text>")
+            return
+
+        memory = get_memory()
+        if memory.add(str(chat_id), args, metadata={"type": "manual"}):
+            reply(chat_id, "✅ Saved to memory")
+        else:
+            reply(chat_id, "❌ Failed to save")
+
+    def _cmd_recall(self, chat_id, args):
+        memory = get_memory()
+
+        if args:
+            results = memory.search(str(chat_id), args, limit=10)
+        else:
+            results = memory.get_recent(str(chat_id), limit=10)
+
+        if not results:
+            reply(chat_id, "No memories found")
+            return
+
+        lines = ["📚 Your memories:", ""]
+        for i, mem in enumerate(results[:10], 1):
+            content = mem["content"][:100]
+            if len(mem["content"]) > 100:
+                content += "..."
+            lines.append(f"{i}. {content}")
+
+        reply(chat_id, "\n".join(lines))
+
+    def _cmd_forget(self, chat_id, args):
+        if not args:
+            reply(chat_id, "Usage: /forget <query or 'all'>")
+            return
+
+        memory = get_memory()
+
+        if args.lower() == "all":
+            if memory.clear_all(str(chat_id)):
+                reply(chat_id, "🗑️ All memories cleared")
+            else:
+                reply(chat_id, "❌ Failed to clear")
+        else:
+            count = memory.delete_by_query(str(chat_id), args)
+            reply(chat_id, f"🗑️ Deleted {count} memory(s)")
+
+    def _cmd_memstats(self, chat_id, _):
+        memory = get_memory()
+        stats = memory.get_stats(str(chat_id))
+        type_info = "\n".join([f"  {t}: {c}" for t, c in stats.get("by_type", {}).items()])
+        reply(chat_id,
+            f"📊 Memory Stats:\n"
+            f"Total: {stats['count']} memories\n"
+            f"Newest: {stats['newest'] or 'N/A'}\n"
+            f"Oldest: {stats['oldest'] or 'N/A'}\n"
+            f"By type:\n{type_info or '  N/A'}")
+
+    def _cmd_metamem(self, chat_id, _):
+        memory = get_memory()
+        results = memory.get_by_type(str(chat_id), "meta_update", limit=5)
+
+        if not results:
+            reply(chat_id, "No meta-update memories found")
+            return
+
+        lines = ["🔄 Meta-Update Memories (Self-Referential):", ""]
+        for i, mem in enumerate(results, 1):
+            content = mem["content"][:150]
+            if len(mem["content"]) > 150:
+                content += "..."
+            lines.append(f"{i}. [{mem['timestamp']}] {content}")
+
+        reply(chat_id, "\n".join(lines))
 
     def handle_callback_query(self, callback_query):
         """Process callback queries (inline button clicks)."""
@@ -528,8 +682,7 @@ class BotHandler:
         if not chat_id or not data:
             return
 
-        if not tmux_exists():
-            reply(chat_id, "tmux session not found")
+        if not self._require_tmux(chat_id):
             return
 
         print(f"Callback from {chat_id}: {data}")
@@ -564,7 +717,6 @@ class BotHandler:
         print(f"MateCode Bridge started | tmux: {TMUX_SESSION}")
         print(f"Offset: {self.offset}")
 
-        # Start response monitor
         response_monitor.start()
 
         try:
@@ -588,7 +740,7 @@ class BotHandler:
                             print(f"Error handling update {update_id}: {e}")
 
                         self.offset = update_id + 1
-                        self.save_offset(self.offset)
+                        self._save_offset(self.offset)
 
                     if not updates:
                         time.sleep(1)

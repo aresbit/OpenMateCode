@@ -54,6 +54,7 @@ chmod +x ~/.claude/hooks/send-to-telegram.sh
 - ./matecode.sh
 - ./tmux-setup.sh
 - tmux source-file ~/.tmux.conf
+- ./bridge_manager stop
 
 ```bash
 ./matecode.sh start      # 启动服务
@@ -119,6 +120,11 @@ export MEMORY_MAX_CONTEXT=2000    # 注入上下文的最大字符数
 | `start_bridge.sh` | 单独启动 bridge |
 | `stop_bridge.sh` | 单独停止 bridge |
 | `hooks/send-to-telegram.sh` | Claude Stop 钩子 |
+
+## 最佳实践
+- 退出 cc后 tmux kill-session -t claude 退出 tmux
+- 执行 ./matecode stop 清理环境后再执行./matecode.sh 可以避免一次发送多次回复 以及多个bot切换产生的意外hook失效。
+- alias 指令后方便在其他目录拉起工作环境 例如在 dev0201目录完成当日vibe code。
 
 ## License
 
