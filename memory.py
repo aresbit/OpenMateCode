@@ -6,25 +6,30 @@ import json
 import os
 import re
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Dict, List, Optional
+from functools import wraps
+from typing import Any, Dict, List, Optional, Tuple, Union, Callable
+
 
 MEMORY_DIR = os.path.expanduser("~/.matecode")
 MEMORY_DB = os.path.join(MEMORY_DIR, "memory.db")
-MAX_CONTENT_LENGTH = 10000
 
 
 class LocalMemory:
     """Local SQLite-based memory storage with FTS5 search."""
+
+    MAX_CONTENT_LENGTH = 10000
+    DEFAULT_MESSAGE_TYPE = "conversation"
 
     def __init__(self, db_path: str = MEMORY_DB):
         self.db_path = db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._init_db()
 
-    def _init_db(self):
+    def _init_db(self) -> None:
         """Initialize SQLite database with FTS5."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_connection() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS memories (
                     id TEXT PRIMARY KEY,
@@ -44,12 +49,22 @@ class LocalMemory:
             """)
             conn.commit()
 
+    @contextmanager
+    def _get_connection(self):
+        """Context manager for database connections."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+
     def _generate_id(self, user_id: str, content: str) -> str:
         """Generate unique ID for memory entry."""
         data = f"{user_id}:{content}:{datetime.now().isoformat()}"
         return hashlib.md5(data.encode()).hexdigest()
 
-    def _row_to_dict(self, row, include_relevance: bool = False) -> Dict:
+    def _row_to_dict(self, row: Tuple, include_relevance: bool = False) -> Dict[str, Any]:
         """Convert database row to memory dictionary."""
         result = {
             "id": row[0],
@@ -61,18 +76,18 @@ class LocalMemory:
             result["relevance"] = row[4]
         return result
 
-    def add(self, user_id: str, content: str, metadata: Optional[Dict] = None,
-            message_type: str = "conversation") -> bool:
+    def add(self, user_id: str, content: str, metadata: Optional[Dict[str, Any]] = None,
+            message_type: str = DEFAULT_MESSAGE_TYPE) -> bool:
         """Add a memory entry."""
         if not content or not content.strip():
             return False
 
-        content = content.strip()[:MAX_CONTENT_LENGTH]
+        content = content.strip()[:self.MAX_CONTENT_LENGTH]
         memory_id = self._generate_id(user_id, content)
         metadata_json = json.dumps(metadata) if metadata else None
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 conn.execute(
                     """INSERT OR REPLACE INTO memories
                        (id, user_id, content, timestamp, metadata, message_type)
@@ -90,17 +105,17 @@ class LocalMemory:
             print(f"Error adding memory: {e}")
             return False
 
-    def search(self, user_id: str, query: str, limit: int = 5) -> List[Dict]:
+    def search(self, user_id: str, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """Search memories using FTS5."""
         if not query or not query.strip():
             return []
 
-        query = self._sanitize_query(query)
-        if not query:
+        sanitized_query = self._sanitize_query(query)
+        if not sanitized_query:
             return []
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 cursor = conn.execute(
                     """SELECT m.id, m.content, m.timestamp, m.metadata, rank
                        FROM memories m
@@ -108,17 +123,17 @@ class LocalMemory:
                        WHERE m.user_id = ? AND memory_search MATCH ?
                        ORDER BY rank
                        LIMIT ?""",
-                    (user_id, query, limit)
+                    (user_id, sanitized_query, limit)
                 )
                 return [self._row_to_dict(row, include_relevance=True) for row in cursor.fetchall()]
         except sqlite3.Error as e:
             print(f"Error searching memories: {e}")
             return []
 
-    def get_recent(self, user_id: str, limit: int = 10) -> List[Dict]:
+    def get_recent(self, user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Get recent memories without search."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 cursor = conn.execute(
                     """SELECT id, content, timestamp, metadata
                        FROM memories
@@ -132,10 +147,10 @@ class LocalMemory:
             print(f"Error getting recent memories: {e}")
             return []
 
-    def get_by_type(self, user_id: str, message_type: str, limit: int = 10) -> List[Dict]:
+    def get_by_type(self, user_id: str, message_type: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Get memories by message type."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 cursor = conn.execute(
                     """SELECT id, content, timestamp, metadata
                        FROM memories
@@ -152,7 +167,7 @@ class LocalMemory:
     def delete(self, user_id: str, memory_id: str) -> bool:
         """Delete a specific memory by ID."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 cursor = conn.execute(
                     "SELECT rowid FROM memories WHERE id = ? AND user_id = ?",
                     (memory_id, user_id)
@@ -178,7 +193,7 @@ class LocalMemory:
     def clear_all(self, user_id: str) -> bool:
         """Clear all memories for a user."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 cursor = conn.execute("SELECT rowid FROM memories WHERE user_id = ?", (user_id,))
                 rowids = [row[0] for row in cursor.fetchall()]
 
@@ -192,10 +207,10 @@ class LocalMemory:
             print(f"Error clearing memories: {e}")
             return False
 
-    def get_stats(self, user_id: str) -> Dict:
+    def get_stats(self, user_id: str) -> Dict[str, Any]:
         """Get memory statistics for a user."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 cursor = conn.execute(
                     "SELECT COUNT(*), MAX(timestamp), MIN(timestamp) FROM memories WHERE user_id = ?",
                     (user_id,)
