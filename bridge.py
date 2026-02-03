@@ -103,9 +103,9 @@ def tmux_exists() -> bool:
     """Check if tmux session exists."""
     return TmuxManager.exists()
 
-def reply(chat_id: int, text: str) -> None:
-    """Send a text message to a chat."""
-    TelegramAPI.reply(chat_id, text)
+def reply(chat_id: int, text: str) -> bool:
+    """Send a text message to a chat. Returns True on success."""
+    return TelegramAPI.reply(chat_id, text)
 
 def telegram_api(method: str, data: Optional[Dict] = None) -> Optional[Dict]:
     """Make a request to the Telegram Bot API."""
@@ -182,9 +182,39 @@ class TelegramAPI:
         TelegramAPI.call("sendChatAction", {"chat_id": chat_id, "action": "typing"})
 
     @staticmethod
-    def reply(chat_id: int, text: str) -> None:
-        """Send a text message to a chat."""
-        TelegramAPI.call("sendMessage", {"chat_id": chat_id, "text": text})
+    def reply(chat_id: int, text: str) -> bool:
+        """Send a text message to a chat. Returns True on success, False on failure."""
+        # Telegram has a 4096 character limit per message
+        MAX_LENGTH = 4000  # Leave some margin
+
+        if len(text) <= MAX_LENGTH:
+            result = TelegramAPI.call("sendMessage", {"chat_id": chat_id, "text": text})
+            return result is not None and result.get("ok", False)
+
+        # Split long messages into chunks
+        chunks = []
+        current_chunk = ""
+
+        for line in text.split('\n'):
+            if len(current_chunk) + len(line) + 1 > MAX_LENGTH:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = line
+            else:
+                current_chunk += '\n' + line if current_chunk else line
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        # Send chunks
+        all_success = True
+        for i, chunk in enumerate(chunks):
+            prefix = f"[{i+1}/{len(chunks)}] " if len(chunks) > 1 else ""
+            result = TelegramAPI.call("sendMessage", {"chat_id": chat_id, "text": prefix + chunk})
+            if result is None or not result.get("ok", False):
+                all_success = False
+
+        return all_success
 
 
 class TmuxManager:
@@ -348,13 +378,19 @@ def find_latest_transcript():
     return max(all_transcripts, key=lambda p: p.stat().st_mtime) if all_transcripts else None
 
 
-def extract_assistant_responses(transcript_path, last_response_pos=0):
-    """Extract assistant responses from transcript starting from a position."""
+def extract_assistant_responses(transcript_path, last_response_pos=0, seen_message_ids=None):
+    """Extract assistant responses from transcript starting from a position.
+
+    Uses incremental reading - only processes new lines since last_position.
+    Tracks seen message IDs across calls to avoid duplicates.
+    """
     if not transcript_path or not transcript_path.exists():
-        return "", 0
+        return "", 0, seen_message_ids or set()
+
+    if seen_message_ids is None:
+        seen_message_ids = set()
 
     responses = []
-    seen_message_ids = set()  # Track processed message IDs to avoid duplicates
     current_pos = 0
     found_new_content = False
 
@@ -373,19 +409,8 @@ def extract_assistant_responses(transcript_path, last_response_pos=0):
                     message = entry.get("message", {})
                     msg_id = message.get("id")
 
-                    # Skip if we've already processed this message ID
-                    if msg_id and msg_id in seen_message_ids:
-                        continue
-
                     # Extract text blocks (including those after tool_use)
                     text_content = []
-                    has_tool_use = False
-
-                    # First pass: check if there's any tool_use
-                    for block in message.get("content", []):
-                        if block.get("type") == "tool_use":
-                            has_tool_use = True
-                            break
 
                     # Extract text content
                     for block in message.get("content", []):
@@ -394,21 +419,29 @@ def extract_assistant_responses(transcript_path, last_response_pos=0):
                             # Skip XML observation blocks and empty text
                             if not text:
                                 continue
-                            # Skip pure XML blocks
-                            if text.startswith("<") and ">" in text:
+                            # Skip pure XML blocks (like <observation> or <memory>)
+                            # but allow text that happens to start with < (like code examples)
+                            if text.startswith("<") and text.endswith(">") and "/" in text[1:]:
                                 continue
-                            # Skip markdown code blocks containing XML/observation
-                            if text.startswith("```") and ("</" in text or "observation" in text.lower()):
+                            # Skip markdown XML code blocks only
+                            if text.startswith("```xml") or text.startswith("```\n<"):
                                 continue
                             text_content.append(text)
 
                     # Only include responses that have actual text content
-                    # This helps avoid empty tool_use-only messages
                     if text_content:
+                        full_text = "\n".join(text_content)
+                        # For new messages, add to responses
+                        # For existing messages, we skip (Claude sends complete messages, not deltas)
                         if msg_id:
-                            seen_message_ids.add(msg_id)
-                        responses.append("\n".join(text_content))
-                        found_new_content = True
+                            if msg_id not in seen_message_ids:
+                                seen_message_ids.add(msg_id)
+                                responses.append(full_text)
+                                found_new_content = True
+                        else:
+                            # No message ID, treat as new content
+                            responses.append(full_text)
+                            found_new_content = True
 
             except (json.JSONDecodeError, KeyError):
                 # Skip malformed lines
@@ -416,13 +449,28 @@ def extract_assistant_responses(transcript_path, last_response_pos=0):
 
     except Exception as e:
         print(f"Error reading transcript: {e}")
-        return "", last_response_pos
+        return "", last_response_pos, seen_message_ids
 
     # 如果没有找到新内容，保持原位置不变
     if not found_new_content:
-        return "", last_response_pos
+        return "", last_response_pos, seen_message_ids
 
-    return "\n\n".join(responses).strip(), current_pos
+    return "\n\n".join(responses).strip(), current_pos, seen_message_ids
+
+
+class PendingFileHandler:
+    """Handle pending file creation events."""
+
+    def __init__(self, callback):
+        self.callback = callback
+
+    def on_created(self, event):
+        if event.src_path.endswith('telegram_pending'):
+            self.callback()
+
+    def on_modified(self, event):
+        if event.src_path.endswith('telegram_pending'):
+            self.callback()
 
 
 class ResponseMonitor:
@@ -436,6 +484,9 @@ class ResponseMonitor:
         self.last_position = 0
         self.response_queue = queue.Queue()
         self.observer = None
+        self._checking = False
+        self._seen_message_ids = set()  # Track processed message IDs for current file
+        self._file_states = {}  # Track read positions per transcript file: {path: {'position': int, 'seen_ids': set}}
 
     def start(self):
         """Start the response monitor with file watching."""
@@ -451,37 +502,40 @@ class ResponseMonitor:
         self.monitor_thread.start()
         print("Response monitor started with file watching")
 
-        try:
-            event_handler = PendingFileHandler(self._immediate_response_check)
-            self.observer = watchdog.observers.Observer()
-            self.observer.schedule(event_handler, str(Config.PENDING_FILE.parent), recursive=False)
-            self.observer.start()
-            print(f"[DEBUG] File watcher started watching {Config.PENDING_FILE.parent}")
-        except Exception as e:
-            print(f"[WARN] Could not start file watcher: {e}")
-
     def _start_file_watcher(self):
-        """Start watching for pending file creation using polling."""
+        """Start watching for transcript file updates using polling."""
         def file_watcher():
-            last_check = 0
+            last_transcript_mtime = 0
+            pending_existed = False
             while self.running:
                 try:
                     current_time = time.time()
-                    if current_time - last_check >= 0.1:  # Check every 100ms
-                        if os.path.exists(Config.PENDING_FILE):
-                            mtime = os.path.getmtime(Config.PENDING_FILE)
-                            if mtime > last_check:
-                                print(f"[DEBUG] File watcher detected pending file update")
+
+                    # Check if pending file exists (indicates active request)
+                    if os.path.exists(Config.PENDING_FILE):
+                        # Find latest transcript and check its modification time
+                        transcript_path = find_latest_transcript()
+                        if transcript_path and transcript_path.exists():
+                            mtime = transcript_path.stat().st_mtime
+                            # Trigger check if transcript is new or modified
+                            if mtime > last_transcript_mtime or not pending_existed:
+                                print(f"[DEBUG] File watcher detected transcript update")
                                 self._immediate_response_check()
-                                last_check = current_time
-                    time.sleep(0.05)
+                                last_transcript_mtime = mtime
+                        pending_existed = True
+                    else:
+                        # Reset when request is complete
+                        pending_existed = False
+                        last_transcript_mtime = 0
+
+                    time.sleep(0.05)  # 50ms polling interval
                 except Exception as e:
                     print(f"[DEBUG] File watcher error: {e}")
                     time.sleep(0.1)
 
         watcher_thread = threading.Thread(target=file_watcher, daemon=True)
         watcher_thread.start()
-        print(f"[DEBUG] File watcher started polling for {Config.PENDING_FILE}")
+        print(f"[DEBUG] File watcher started polling for transcript updates")
 
     def _immediate_response_check(self):
         """Immediate response check when pending file is detected."""
@@ -505,9 +559,25 @@ class ResponseMonitor:
     def _check_for_responses(self):
         """Check for new assistant responses and send to Telegram."""
         pending_exists = os.path.exists(Config.PENDING_FILE)
+
+        # 如果没有 pending 文件，先检查是否还有未发送的响应（延迟发送问题）
         if not pending_exists:
+            # 检查当前 transcript 是否还有新内容
+            transcript_path = find_latest_transcript()
+            if transcript_path and self.last_transcript_path == transcript_path:
+                # 同一文件，检查是否有新内容
+                responses, new_position, self._seen_message_ids = extract_assistant_responses(
+                    transcript_path, self.last_position, self._seen_message_ids
+                )
+                if responses:
+                    # 还有未发送的响应，继续发送
+                    print(f"[DEBUG] Found pending response after pending file removed")
+                    self._process_responses(transcript_path, responses, new_position)
+                    return
+            # 确实没有待发送内容，重置状态
             self.last_transcript_path = None
             self.last_position = 0
+            self._seen_message_ids.clear()
             return
         else:
             print(f"[DEBUG] Response monitor found pending file, checking for responses...")
@@ -524,58 +594,111 @@ class ResponseMonitor:
             if not transcript_path:
                 return
 
-            # 正确处理文件切换：当切换到新文件时重置位置
+            # 修复全量发送问题：使用持久化的位置跟踪
+            # 为每个 transcript 文件维护独立的读取位置和已处理消息ID
             if self.last_transcript_path != transcript_path:
-                self.last_transcript_path = transcript_path
-                self.last_position = 0
+                # 切换到了新文件，保存旧文件的状态
+                if self.last_transcript_path:
+                    self._file_states[self.last_transcript_path] = {
+                        'position': self.last_position,
+                        'seen_ids': self._seen_message_ids.copy()
+                    }
+                # 加载新文件的状态（如果存在）
+                self.last_transcript_path = str(transcript_path)
+                if self.last_transcript_path in self._file_states:
+                    saved_state = self._file_states[self.last_transcript_path]
+                    self.last_position = saved_state['position']
+                    self._seen_message_ids = saved_state['seen_ids'].copy()
+                    print(f"[DEBUG] Restored state for {transcript_path.name}: pos={self.last_position}")
+                else:
+                    # 新文件，从头开始
+                    self.last_position = 0
+                    self._seen_message_ids.clear()
+                    print(f"[DEBUG] New transcript file: {transcript_path.name}")
 
             # 使用增量读取，从上次位置开始读取新内容
-            responses, new_position = extract_assistant_responses(transcript_path, self.last_position)
+            responses, new_position, self._seen_message_ids = extract_assistant_responses(
+                transcript_path, self.last_position, self._seen_message_ids
+            )
+
+            # 即使没有找到文本响应，也要更新位置（可能已经处理了工具调用）
+            self.last_position = new_position
+            # 保存当前状态
+            if self.last_transcript_path:
+                self._file_states[self.last_transcript_path] = {
+                    'position': self.last_position,
+                    'seen_ids': self._seen_message_ids.copy()
+                }
 
             if not responses:
                 return
 
-            # 更新读取位置
-            self.last_position = new_position
+            self._process_responses(transcript_path, responses, new_position)
 
-            if not os.path.exists(Config.CHAT_ID_FILE):
-                return
-
-            with open(Config.CHAT_ID_FILE) as f:
-                chat_id = int(f.read().strip())
-
-            cleaned_responses, memory_update = extract_memory_update(responses)
-
-            # Skip empty responses (e.g., when only XML observations were present)
-            if not cleaned_responses or not cleaned_responses.strip():
-                print(f"Skipping empty response for chat {chat_id}")
-                # 空响应也清理pending文件，避免卡住
-                if os.path.exists(Config.PENDING_FILE):
+        except Exception as e:
+            print(f"Error sending response: {e}")
+            import traceback
+            traceback.print_exc()
+            # 保留pending文件以便重试，但避免无限循环，最多保留10分钟
+            pending_time = 0
+            if os.path.exists(Config.PENDING_FILE):
+                try:
+                    with open(Config.PENDING_FILE) as f:
+                        pending_time = int(f.read().strip())
+                except:
+                    pass
+                if time.time() - pending_time > 600:  # 10 minutes
                     os.remove(Config.PENDING_FILE)
-                    print(f"[DEBUG] Pending file removed for empty response")
-                return
+                    print(f"[DEBUG] Pending file removed after 10min timeout")
+        finally:
+            # 释放锁
+            self._checking = False
 
-            # 先保存到内存，再发送消息
-            self._save_to_memory(chat_id, cleaned_responses, memory_update)
+    def stop(self):
+        """Stop the response monitor."""
+        self.running = False
+        if self.observer:
+            try:
+                self.observer.stop()
+                self.observer.join()
+            except Exception as e:
+                print(f"[DEBUG] Error stopping observer: {e}")
+        if self.monitor_thread:
+            self.monitor_thread.join(timeout=1)
+        print("Response monitor stopped")
 
-            # 发送消息到Telegram
-            reply(chat_id, cleaned_responses)
+    def _process_responses(self, transcript_path, responses, new_position):
+        """Process and send responses to Telegram."""
+        if not os.path.exists(Config.CHAT_ID_FILE):
+            return
+
+        with open(Config.CHAT_ID_FILE) as f:
+            chat_id = int(f.read().strip())
+
+        cleaned_responses, memory_update = extract_memory_update(responses)
+
+        # Skip empty responses (e.g., when only XML observations were present)
+        if not cleaned_responses or not cleaned_responses.strip():
+            print(f"Skipping empty response for chat {chat_id}")
+            # 空响应也清理pending文件，避免卡住
+            if os.path.exists(Config.PENDING_FILE):
+                os.remove(Config.PENDING_FILE)
+                print(f"[DEBUG] Pending file removed for empty response")
+            return
+
+        # 先保存到内存，再发送消息
+        self._save_to_memory(chat_id, cleaned_responses, memory_update)
+
+        # 发送消息到Telegram
+        result = reply(chat_id, cleaned_responses)
+        if result is not False:
             print(f"[DEBUG] Response sent to chat {chat_id}")
-
             # 只有在成功发送响应后才移除pending文件
             if os.path.exists(Config.PENDING_FILE):
                 os.remove(Config.PENDING_FILE)
                 print(f"[DEBUG] Pending file removed after sending response")
-
-        except Exception as e:
-            print(f"Error sending response: {e}")
-            # 发生错误时也清理pending文件，避免无限等待
-            if os.path.exists(Config.PENDING_FILE):
-                os.remove(Config.PENDING_FILE)
-                print(f"[DEBUG] Pending file removed due to error")
-        finally:
-            # 释放锁
-            self._checking = False
+        else:
+            print(f"[DEBUG] Failed to send response, keeping pending file for retry")
 
     def _save_to_memory(self, chat_id, cleaned_responses, memory_update):
         """Save conversation to memory."""
@@ -729,13 +852,13 @@ class MessageQueue:
             print(f"[DEBUG] Waiting for Claude response...")
             # 等待响应生成
             start_time = time.time()
-            timeout = 30
+            timeout = 120  # 增加到120秒超时
             check_count = 0
 
             while time.time() - start_time < timeout:
                 transcript_path = find_latest_transcript()
                 if transcript_path and transcript_path.exists():
-                    responses, _ = extract_assistant_responses(transcript_path, response_monitor.last_position)
+                    responses, _, _ = extract_assistant_responses(transcript_path, response_monitor.last_position, response_monitor._seen_message_ids)
                     if responses and responses.strip():
                         print(f"[DEBUG] Found Claude response after {check_count} checks")
                         # 触发响应检查
@@ -744,6 +867,9 @@ class MessageQueue:
 
                 check_count += 1
                 time.sleep(0.1)
+
+            # 超时后记录日志，但不清理pending文件，让response_monitor继续尝试
+            print(f"[DEBUG] Timeout waiting for response after {timeout}s, letting response_monitor continue")
 
         except Exception as e:
             print(f"Error handling queued message: {e}")
@@ -874,7 +1000,7 @@ class BotHandler:
             transcript_path = find_latest_transcript()
             if transcript_path and transcript_path.exists():
                 # 检查文件中是否有新的assistant响应（使用增量检查）
-                responses, _ = extract_assistant_responses(transcript_path, response_monitor.last_position)
+                responses, _, _ = extract_assistant_responses(transcript_path, response_monitor.last_position, response_monitor._seen_message_ids)
                 if responses and responses.strip():
                     print(f"[DEBUG] Found Claude response after {check_count} checks")
                     return True
@@ -1008,10 +1134,33 @@ class BotHandler:
         reply(chat_id, f"tmux '{Config.TMUX_SESSION}': {status}")
 
     def _cmd_stop(self, chat_id, _):
+        """Stop/interrupt Claude and send any partial response."""
+        # First, check if there's already a response generated
+        # and send it before interrupting
+        if os.path.exists(Config.PENDING_FILE):
+            try:
+                transcript_path = find_latest_transcript()
+                if transcript_path:
+                    responses, new_position, _ = extract_assistant_responses(
+                        transcript_path, response_monitor.last_position, response_monitor._seen_message_ids
+                    )
+                    if responses and responses.strip():
+                        cleaned_responses, _ = extract_memory_update(responses)
+                        if cleaned_responses and cleaned_responses.strip():
+                            reply(chat_id, cleaned_responses)
+                            response_monitor.last_position = new_position
+                            print(f"[DEBUG] Sent partial response before stop")
+            except Exception as e:
+                print(f"[DEBUG] Error checking for partial response: {e}")
+
+        # Now send escape to interrupt Claude
         if tmux_exists():
             tmux_send_escape()
+
+        # Clean up pending file
         if os.path.exists(Config.PENDING_FILE):
             os.remove(Config.PENDING_FILE)
+
         reply(chat_id, "Interrupted")
 
     def _cmd_clear(self, chat_id, _):
