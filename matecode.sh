@@ -90,7 +90,7 @@ start_tmux_claude() {
     else
         tmux new-session -d -s "$TMUX_SESSION"
         sleep 1
-        tmux send-keys -t "$TMUX_SESSION" "claude --dangerously-skip-permissions" C-m
+        tmux send-keys -t "$TMUX_SESSION" "~/.opencode/bin/opencode" C-m
         sleep 2
         print_success "Claude Code 已启动"
     fi

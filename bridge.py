@@ -1277,7 +1277,7 @@ class BotHandler:
         """Continue most recent session."""
         self._start_claude_with_command(
             chat_id,
-            "claude --continue --dangerously-skip-permissions",
+            "~/.opencode/bin/opencode --continue",
             "Continuing..."
         )
 
@@ -1579,13 +1579,13 @@ class BotHandler:
                 session_id = data.split(":", 1)[1]
                 self._start_claude_with_command(
                     chat_id,
-                    f"claude --resume {session_id} --dangerously-skip-permissions",
+                    f"~/.opencode/bin/opencode --session {session_id}",
                     f"Resuming: {session_id[:8]}..."
                 )
             elif data == "continue_recent":
                 self._start_claude_with_command(
                     chat_id,
-                    "claude --continue --dangerously-skip-permissions",
+                    "~/.opencode/bin/opencode --continue",
                     "Continuing most recent..."
                 )
         except Exception as e:
